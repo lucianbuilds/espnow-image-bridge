@@ -5,46 +5,33 @@
 #include "esp_camera.h"
 
 // ============================================================
-// SETTINGS
+// USER SETTINGS
 // ============================================================
 
+// MAC address of the ESP-NOW receiver.
+// Enter the receiver's MAC exactly like this:
+// AA:BB:CC:DD:EE:FF
+#define mac_address "AC:27:6E:A4:D3:38"
+
+// ESP-NOW Wi-Fi channel
 #define ESPNOW_CHANNEL 6
 
+// Capture a new image every 5 seconds
 #define CAPTURE_INTERVAL_MS 5000
 
-// ESP-NOW v1 max packet = 250 bytes
-// 11 bytes reserved for our header
+// JPEG bytes carried by each ESP-NOW packet.
+// 220 + 11 byte header = 231 bytes total.
 #define MAX_PAYLOAD 220
 
+// How long to wait for an ACK
 #define ACK_TIMEOUT_MS 200
+
+// Maximum number of attempts for each packet
 #define MAX_RETRIES 8
 
-// ============================================================
-// RECEIVER MAC ADDRESS
-// ============================================================
-//
-// Replace these six bytes with the MAC printed by your
-// receiver ESP32.
-//
-// Example:
-// AA:BB:CC:DD:EE:FF
-//
-// becomes:
-// {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
-//
-
-uint8_t RECEIVER_MAC[] = {
-    0xAC,
-    0x27,
-    0x6E,
-    0xA4,
-    0xD3,
-    0x38
-};
 
 // ============================================================
-// CAMERA PINS
-// AI Thinker ESP32-CAM
+// AI THINKER ESP32-CAM PINS
 // ============================================================
 
 #define PWDN_GPIO_NUM     32
@@ -66,52 +53,101 @@ uint8_t RECEIVER_MAC[] = {
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+
 // ============================================================
-// ACK STATE
+// GLOBALS
 // ============================================================
+
+uint8_t RECEIVER_MAC[6];
 
 volatile bool ackReceived = false;
-volatile uint32_t ackFrame = 0;
-volatile uint16_t ackSeq = 0;
-
-// ============================================================
-// FRAME COUNTER
-// ============================================================
+volatile uint32_t ackFrameID = 0;
+volatile uint16_t ackSequence = 0;
 
 uint32_t frameCounter = 0;
 
+
 // ============================================================
-// CRC32
+// MAC ADDRESS PARSER
+// ============================================================
+//
+// Converts:
+//
+// "AA:BB:CC:DD:EE:FF"
+//
+// into:
+//
+// {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
+//
 // ============================================================
 
-uint32_t crc32(
-    const uint8_t *data,
-    size_t length
-)
+bool parseMacAddress(const char *macString, uint8_t *mac)
 {
-    uint32_t crc = 0xFFFFFFFF;
+    unsigned int values[6];
 
-    for (size_t i = 0; i < length; i++) {
+    int result = sscanf(
+        macString,
+        "%2x:%2x:%2x:%2x:%2x:%2x",
+        &values[0],
+        &values[1],
+        &values[2],
+        &values[3],
+        &values[4],
+        &values[5]
+    );
 
-        crc ^= data[i];
-
-        for (uint8_t j = 0; j < 8; j++) {
-
-            if (crc & 1) {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-        }
+    if (result != 6)
+    {
+        return false;
     }
 
-    return crc ^ 0xFFFFFFFF;
+    for (int i = 0; i < 6; i++)
+    {
+        if (values[i] > 0xFF)
+        {
+            return false;
+        }
+
+        mac[i] = (uint8_t)values[i];
+    }
+
+    return true;
 }
+
+
+// ============================================================
+// PRINT MAC ADDRESS
+// ============================================================
+
+void printMacAddress(const uint8_t *mac)
+{
+    for (int i = 0; i < 6; i++)
+    {
+        if (mac[i] < 0x10)
+        {
+            Serial.print("0");
+        }
+
+        Serial.print(mac[i], HEX);
+
+        if (i < 5)
+        {
+            Serial.print(":");
+        }
+    }
+}
+
 
 // ============================================================
 // ESP-NOW RECEIVE CALLBACK
+// ============================================================
 //
-// Receives ACKs from the receiver.
+// The receiver sends back a 7-byte ACK:
+//
+// byte 0     = 0x02
+// bytes 1-4  = frame ID
+// bytes 5-6  = sequence number
+//
 // ============================================================
 
 void onDataRecv(
@@ -120,154 +156,168 @@ void onDataRecv(
     int len
 )
 {
-    if (data == nullptr) {
-        return;
-    }
-
-    // ACK is exactly 7 bytes
-    if (len != 7) {
+    if (len != 7)
+    {
         return;
     }
 
     // ACK packet type
-    if (data[0] != 0x02) {
+    if (data[0] != 0x02)
+    {
         return;
     }
 
-    // Decode frame ID
-    uint32_t frameId =
+    uint32_t frameID =
         ((uint32_t)data[1]) |
         ((uint32_t)data[2] << 8) |
         ((uint32_t)data[3] << 16) |
         ((uint32_t)data[4] << 24);
 
-    // Decode sequence
-    uint16_t seq =
+    uint16_t sequence =
         ((uint16_t)data[5]) |
         ((uint16_t)data[6] << 8);
 
-    ackFrame = frameId;
-    ackSeq = seq;
+    ackFrameID = frameID;
+    ackSequence = sequence;
     ackReceived = true;
 }
 
+
 // ============================================================
-// SEND ONE IMAGE PACKET
-//
-// Packet layout:
-//
-// Byte 0       type
-// Bytes 1-4    frame ID
-// Bytes 5-6    sequence
-// Bytes 7-8    total packets
-// Bytes 9-10   payload length
-// Bytes 11...  JPEG data
-//
-// Header = exactly 11 bytes
-// Maximum packet = 231 bytes with 220-byte payload
+// CRC32
 // ============================================================
 
-bool sendPacketReliably(
-    uint32_t frameId,
-    uint16_t seq,
-    uint16_t total,
-    const uint8_t *payload,
-    uint16_t payloadLen
-)
+uint32_t calculateCRC32(const uint8_t *data, size_t length)
 {
-    if (payloadLen > MAX_PAYLOAD) {
-        Serial.println("ERROR: Payload too large");
-        return false;
+    uint32_t crc = 0xFFFFFFFF;
+
+    for (size_t i = 0; i < length; i++)
+    {
+        crc ^= data[i];
+
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 1)
+            {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
     }
 
+    return ~crc;
+}
+
+
+// ============================================================
+// SEND ONE IMAGE PACKET
+// ============================================================
+//
+// Packet format:
+//
+// Byte 0       : packet type = 0x01
+// Bytes 1-4    : frame ID
+// Bytes 5-6    : sequence number
+// Bytes 7-8    : total packets
+// Bytes 9-10   : JPEG payload length
+// Bytes 11...  : JPEG data
+//
+// Maximum:
+// 11 + 220 = 231 bytes
+//
+// ============================================================
+
+bool sendImagePacket(
+    uint32_t frameID,
+    uint16_t sequence,
+    uint16_t totalPackets,
+    const uint8_t *payload,
+    uint16_t payloadLength
+)
+{
     uint8_t packet[11 + MAX_PAYLOAD];
 
     // --------------------------------------------------------
-    // Packet type
+    // Build exact packet manually.
+    // This avoids C++ struct-padding problems.
     // --------------------------------------------------------
 
     packet[0] = 0x01;
 
-    // --------------------------------------------------------
-    // Frame ID - little endian
-    // --------------------------------------------------------
+    // Frame ID
+    packet[1] = frameID & 0xFF;
+    packet[2] = (frameID >> 8) & 0xFF;
+    packet[3] = (frameID >> 16) & 0xFF;
+    packet[4] = (frameID >> 24) & 0xFF;
 
-    packet[1] = (frameId >> 0) & 0xFF;
-    packet[2] = (frameId >> 8) & 0xFF;
-    packet[3] = (frameId >> 16) & 0xFF;
-    packet[4] = (frameId >> 24) & 0xFF;
+    // Sequence
+    packet[5] = sequence & 0xFF;
+    packet[6] = (sequence >> 8) & 0xFF;
 
-    // --------------------------------------------------------
-    // Sequence number
-    // --------------------------------------------------------
-
-    packet[5] = (seq >> 0) & 0xFF;
-    packet[6] = (seq >> 8) & 0xFF;
-
-    // --------------------------------------------------------
     // Total packets
-    // --------------------------------------------------------
+    packet[7] = totalPackets & 0xFF;
+    packet[8] = (totalPackets >> 8) & 0xFF;
 
-    packet[7] = (total >> 0) & 0xFF;
-    packet[8] = (total >> 8) & 0xFF;
-
-    // --------------------------------------------------------
     // Payload length
-    // --------------------------------------------------------
+    packet[9] = payloadLength & 0xFF;
+    packet[10] = (payloadLength >> 8) & 0xFF;
 
-    packet[9] = (payloadLen >> 0) & 0xFF;
-    packet[10] = (payloadLen >> 8) & 0xFF;
-
-    // --------------------------------------------------------
-    // JPEG data
-    // --------------------------------------------------------
-
+    // JPEG payload
     memcpy(
         packet + 11,
         payload,
-        payloadLen
+        payloadLength
     );
 
-    uint16_t packetLen = 11 + payloadLen;
+    size_t packetLength = 11 + payloadLength;
 
-    // Safety check
-    if (packetLen > 250) {
-        Serial.println("ERROR: ESP-NOW packet too large");
-        return false;
-    }
 
     // --------------------------------------------------------
-    // Retry loop
+    // Try sending this packet
     // --------------------------------------------------------
 
-    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-
+    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++)
+    {
         ackReceived = false;
-        ackFrame = 0;
-        ackSeq = 0;
+        ackFrameID = 0;
+        ackSequence = 0;
 
         esp_err_t result = esp_now_send(
             RECEIVER_MAC,
             packet,
-            packetLen
+            packetLength
         );
 
-        if (result != ESP_OK) {
+        if (result != ESP_OK)
+        {
+            Serial.printf(
+                "ESP-NOW send error on seq %u, attempt %d: %s\n",
+                sequence,
+                attempt,
+                esp_err_to_name(result)
+            );
 
-            Serial.print("esp_now_send error: ");
-            Serial.println(result);
-
-            delay(10);
+            delay(20);
             continue;
         }
 
-        unsigned long start = millis();
 
-        while (millis() - start < ACK_TIMEOUT_MS) {
+        // ----------------------------------------------------
+        // Wait for ACK
+        // ----------------------------------------------------
 
-            if (ackReceived &&
-                ackFrame == frameId &&
-                ackSeq == seq)
+        unsigned long startTime = millis();
+
+        while (millis() - startTime < ACK_TIMEOUT_MS)
+        {
+            if (
+                ackReceived &&
+                ackFrameID == frameID &&
+                ackSequence == sequence
+            )
             {
                 return true;
             }
@@ -275,93 +325,123 @@ bool sendPacketReliably(
             delay(1);
         }
 
-        Serial.print("Retry packet ");
-        Serial.print(seq);
-        Serial.print(" (attempt ");
-        Serial.print(attempt);
-        Serial.println(")");
+        Serial.printf(
+            "No ACK for packet %u/%u, attempt %d/%d\n",
+            sequence + 1,
+            totalPackets,
+            attempt,
+            MAX_RETRIES
+        );
     }
 
     return false;
 }
 
+
 // ============================================================
-// TRANSMIT COMPLETE IMAGE
+// SEND ENTIRE IMAGE
 // ============================================================
 
-bool transmitImage(
-    const uint8_t *image,
-    size_t imageSize
-)
+bool sendImage(camera_fb_t *fb)
 {
-    uint32_t frameId = ++frameCounter;
+    uint32_t frameID = frameCounter++;
 
     uint16_t totalPackets =
-        (imageSize + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
+        (fb->len + MAX_PAYLOAD - 1) / MAX_PAYLOAD;
 
-    uint32_t imageCRC =
-        crc32(image, imageSize);
+    uint32_t crc = calculateCRC32(
+        fb->buf,
+        fb->len
+    );
 
     Serial.println();
-    Serial.println("------------------------------");
+    Serial.println("================================");
+    Serial.printf(
+        "Sending frame %lu\n",
+        (unsigned long)frameID
+    );
 
-    Serial.print("Frame: ");
-    Serial.println(frameId);
+    Serial.printf(
+        "JPEG size: %u bytes\n",
+        (unsigned int)fb->len
+    );
 
-    Serial.print("JPEG size: ");
-    Serial.print(imageSize);
-    Serial.println(" bytes");
+    Serial.printf(
+        "Packets: %u\n",
+        totalPackets
+    );
 
-    Serial.print("Packets: ");
-    Serial.println(totalPackets);
+    Serial.printf(
+        "CRC32: %08lX\n",
+        (unsigned long)crc
+    );
 
-    Serial.print("CRC32: ");
-    Serial.println(imageCRC, HEX);
+    Serial.println(
+        "================================"
+    );
+
 
     // --------------------------------------------------------
-    // Send each packet
+    // Send every JPEG chunk
     // --------------------------------------------------------
 
-    for (uint16_t seq = 0; seq < totalPackets; seq++) {
-
+    for (
+        uint16_t sequence = 0;
+        sequence < totalPackets;
+        sequence++
+    )
+    {
         size_t offset =
-            (size_t)seq * MAX_PAYLOAD;
+            (size_t)sequence * MAX_PAYLOAD;
 
         size_t remaining =
-            imageSize - offset;
+            fb->len - offset;
 
-        uint16_t payloadLen =
+        uint16_t payloadLength =
             remaining > MAX_PAYLOAD
                 ? MAX_PAYLOAD
                 : remaining;
 
-        bool success = sendPacketReliably(
-            frameId,
-            seq,
+        bool success = sendImagePacket(
+            frameID,
+            sequence,
             totalPackets,
-            image + offset,
-            payloadLen
+            fb->buf + offset,
+            payloadLength
         );
 
-        if (!success) {
-
-            Serial.print("FAILED at packet ");
-            Serial.println(seq);
+        if (!success)
+        {
+            Serial.printf(
+                "FAILED packet %u/%u\n",
+                sequence + 1,
+                totalPackets
+            );
 
             return false;
         }
+
+        Serial.printf(
+            "Packet %u/%u OK\n",
+            sequence + 1,
+            totalPackets
+        );
     }
 
-    Serial.println("Image transmission successful.");
+    Serial.println();
+    Serial.println(
+        "Image transmission successful."
+    );
 
     return true;
 }
+
 
 // ============================================================
 // CAMERA INITIALIZATION
 // ============================================================
 
-bool initCamera()
+bool initializeCamera()
 {
     camera_config_t config;
 
@@ -392,92 +472,187 @@ bool initCamera()
 
     config.pixel_format = PIXFORMAT_JPEG;
 
+
     // --------------------------------------------------------
-    // Use PSRAM when available
+    // Use VGA when PSRAM is available.
+    // Otherwise fall back to QVGA.
     // --------------------------------------------------------
 
-    if (psramFound()) {
-
+    if (psramFound())
+    {
         config.frame_size = FRAMESIZE_VGA;
         config.jpeg_quality = 15;
         config.fb_count = 1;
         config.fb_location = CAMERA_FB_IN_PSRAM;
 
-    } else {
-
-        Serial.println("WARNING: PSRAM not found");
-
+        Serial.println(
+            "PSRAM detected - using VGA."
+        );
+    }
+    else
+    {
         config.frame_size = FRAMESIZE_QVGA;
-        config.jpeg_quality = 18;
+        config.jpeg_quality = 15;
         config.fb_count = 1;
         config.fb_location = CAMERA_FB_IN_DRAM;
+
+        Serial.println(
+            "No PSRAM - using QVGA."
+        );
     }
 
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    esp_err_t result = esp_camera_init(&config);
 
-    esp_err_t result =
-        esp_camera_init(&config);
-
-    if (result != ESP_OK) {
-
-        Serial.print("Camera init failed: 0x");
-        Serial.println(result, HEX);
+    if (result != ESP_OK)
+    {
+        Serial.printf(
+            "Camera initialization failed: 0x%X\n",
+            result
+        );
 
         return false;
     }
 
-    Serial.println("Camera initialized");
-
     return true;
 }
 
+
 // ============================================================
-// INITIALIZE ESP-NOW
+// SETUP
 // ============================================================
 
-bool initESPNow()
+void setup()
 {
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println();
+    Serial.println(
+        "========================================"
+    );
+    Serial.println(
+        "ESP32-CAM ESP-NOW TRANSMITTER"
+    );
+    Serial.println(
+        "========================================"
+    );
+
+
+    // --------------------------------------------------------
+    // Parse receiver MAC
+    // --------------------------------------------------------
+
+    Serial.print(
+        "Configured receiver MAC: "
+    );
+
+    Serial.println(mac_address);
+
+    if (!parseMacAddress(
+            mac_address,
+            RECEIVER_MAC
+        ))
+    {
+        Serial.println();
+        Serial.println(
+            "ERROR: Invalid MAC address!"
+        );
+
+        Serial.println(
+            "Expected format:"
+        );
+
+        Serial.println(
+            "AA:BB:CC:DD:EE:FF"
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
+    Serial.print(
+        "Parsed receiver MAC: "
+    );
+
+    printMacAddress(RECEIVER_MAC);
+
+    Serial.println();
+
+
+    // --------------------------------------------------------
+    // Wi-Fi / ESP-NOW
+    // --------------------------------------------------------
+
     WiFi.mode(WIFI_STA);
 
     delay(100);
 
-    // Force channel
-    esp_err_t result =
+    // Force ESP-NOW channel.
+    esp_err_t channelResult =
         esp_wifi_set_channel(
             ESPNOW_CHANNEL,
             WIFI_SECOND_CHAN_NONE
         );
 
-    if (result != ESP_OK) {
-
-        Serial.print("Failed to set WiFi channel: ");
-        Serial.println(result);
-
-        return false;
+    if (channelResult != ESP_OK)
+    {
+        Serial.printf(
+            "Failed to set Wi-Fi channel: %s\n",
+            esp_err_to_name(channelResult)
+        );
     }
+
+    Serial.printf(
+        "ESP-NOW channel: %d\n",
+        ESPNOW_CHANNEL
+    );
+
+
+    // --------------------------------------------------------
+    // Print our own MAC
+    // --------------------------------------------------------
+
+    Serial.print(
+        "Transmitter MAC: "
+    );
+
+    Serial.println(
+        WiFi.macAddress()
+    );
+
 
     // --------------------------------------------------------
     // Initialize ESP-NOW
     // --------------------------------------------------------
 
-    result = esp_now_init();
+    if (esp_now_init() != ESP_OK)
+    {
+        Serial.println(
+            "ERROR: ESP-NOW initialization failed!"
+        );
 
-    if (result != ESP_OK) {
-
-        Serial.print("ESP-NOW init failed: ");
-        Serial.println(result);
-
-        return false;
+        while (true)
+        {
+            delay(1000);
+        }
     }
 
-    // --------------------------------------------------------
-    // Register ACK callback
-    // --------------------------------------------------------
-
-    esp_now_register_recv_cb(onDataRecv);
 
     // --------------------------------------------------------
-    // Add receiver peer
+    // Register receive callback
+    // --------------------------------------------------------
+
+    esp_now_register_recv_cb(
+        onDataRecv
+    );
+
+
+    // --------------------------------------------------------
+    // Add receiver as ESP-NOW peer
     // --------------------------------------------------------
 
     esp_now_peer_info_t peerInfo = {};
@@ -491,66 +666,57 @@ bool initESPNow()
     peerInfo.channel = ESPNOW_CHANNEL;
     peerInfo.encrypt = false;
 
-    result = esp_now_add_peer(&peerInfo);
+    esp_err_t peerResult =
+        esp_now_add_peer(&peerInfo);
 
-    if (result != ESP_OK &&
-        result != ESP_ERR_ESPNOW_EXIST)
+    if (peerResult != ESP_OK)
     {
-        Serial.print("Failed to add receiver peer: ");
-        Serial.println(result);
+        Serial.printf(
+            "ERROR: Failed to add receiver peer: %s\n",
+            esp_err_to_name(peerResult)
+        );
 
-        return false;
+        while (true)
+        {
+            delay(1000);
+        }
     }
 
-    return true;
-}
+    Serial.println(
+        "Receiver peer added successfully."
+    );
 
-// ============================================================
-// SETUP
-// ============================================================
 
-void setup()
-{
-    Serial.begin(115200);
+    // --------------------------------------------------------
+    // Initialize camera
+    // --------------------------------------------------------
 
-    delay(1000);
+    if (!initializeCamera())
+    {
+        Serial.println(
+            "ERROR: Camera initialization failed!"
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
+    Serial.println(
+        "Camera initialized successfully."
+    );
 
     Serial.println();
-    Serial.println("==============================");
-    Serial.println("ESP32-CAM ESP-NOW TRANSMITTER");
-    Serial.println("==============================");
+    Serial.println(
+        "Ready."
+    );
 
-    // --------------------------------------------------------
-    // Camera
-    // --------------------------------------------------------
-
-    if (!initCamera()) {
-
-        Serial.println("Camera initialization FAILED");
-
-        while (true) {
-            delay(1000);
-        }
-    }
-
-    // --------------------------------------------------------
-    // ESP-NOW
-    // --------------------------------------------------------
-
-    if (!initESPNow()) {
-
-        Serial.println("ESP-NOW initialization FAILED");
-
-        while (true) {
-            delay(1000);
-        }
-    }
-
-    Serial.print("ESP-NOW channel: ");
-    Serial.println(ESPNOW_CHANNEL);
-
-    Serial.println("Transmitter ready.");
+    Serial.println(
+        "========================================"
+    );
 }
+
 
 // ============================================================
 // MAIN LOOP
@@ -558,84 +724,89 @@ void setup()
 
 void loop()
 {
+    // --------------------------------------------------------
+    // Capture image
+    // --------------------------------------------------------
+
     Serial.println();
-    Serial.println("Capturing...");
+    Serial.println(
+        "Capturing image..."
+    );
 
     camera_fb_t *fb =
         esp_camera_fb_get();
 
-    if (fb == nullptr) {
-
-        Serial.println("Camera capture FAILED");
-
-        delay(CAPTURE_INTERVAL_MS);
-
-        return;
-    }
-
-    // --------------------------------------------------------
-    // Basic JPEG validation
-    // --------------------------------------------------------
-
-    if (fb->format != PIXFORMAT_JPEG ||
-        fb->len < 4)
+    if (!fb)
     {
-        Serial.println("Invalid JPEG");
-
-        esp_camera_fb_return(fb);
-
-        delay(CAPTURE_INTERVAL_MS);
-
-        return;
-    }
-
-    // JPEG should begin FF D8
-    bool validStart =
-        fb->buf[0] == 0xFF &&
-        fb->buf[1] == 0xD8;
-
-    // JPEG should end FF D9
-    bool validEnd =
-        fb->buf[fb->len - 2] == 0xFF &&
-        fb->buf[fb->len - 1] == 0xD9;
-
-    if (!validStart || !validEnd) {
-
-        Serial.println("JPEG markers invalid");
-
-        esp_camera_fb_return(fb);
-
-        delay(CAPTURE_INTERVAL_MS);
-
-        return;
-    }
-
-    Serial.print("Captured ");
-    Serial.print(fb->len);
-    Serial.println(" bytes");
-
-    // --------------------------------------------------------
-    // Transmit
-    // --------------------------------------------------------
-
-    bool success =
-        transmitImage(
-            fb->buf,
-            fb->len
+        Serial.println(
+            "ERROR: Camera capture failed!"
         );
 
-    if (!success) {
-        Serial.println("Image transmission FAILED.");
+        delay(CAPTURE_INTERVAL_MS);
+
+        return;
     }
 
+
     // --------------------------------------------------------
-    // Release camera framebuffer
+    // Validate JPEG
+    // --------------------------------------------------------
+
+    bool validJPEG = false;
+
+    if (fb->len >= 4)
+    {
+        bool startsJPEG =
+            fb->buf[0] == 0xFF &&
+            fb->buf[1] == 0xD8;
+
+        bool endsJPEG =
+            fb->buf[fb->len - 2] == 0xFF &&
+            fb->buf[fb->len - 1] == 0xD9;
+
+        validJPEG =
+            startsJPEG &&
+            endsJPEG;
+    }
+
+    if (!validJPEG)
+    {
+        Serial.println(
+            "ERROR: Captured data is not a valid JPEG!"
+        );
+
+        esp_camera_fb_return(fb);
+
+        delay(CAPTURE_INTERVAL_MS);
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // Send image
+    // --------------------------------------------------------
+
+    bool success = sendImage(fb);
+
+    if (!success)
+    {
+        Serial.println();
+        Serial.println(
+            "Image transmission failed."
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // Return framebuffer
     // --------------------------------------------------------
 
     esp_camera_fb_return(fb);
 
+
     // --------------------------------------------------------
-    // Wait before next capture
+    // Wait before next image
     // --------------------------------------------------------
 
     delay(CAPTURE_INTERVAL_MS);
