@@ -7,7 +7,7 @@ import time
 # Lucian H
 # Serial image reconstruction system for esp-now image bridge
 # Code will decode the esp-now image packets and save them as jpgs
-
+# Linux version
 
 # ============================================================
 # SETTINGS
