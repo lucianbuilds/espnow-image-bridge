@@ -4,7 +4,7 @@ This is a C++ program to relay images from an ESP32 CAM to another ESP32 via esp
 
   
 
-The ESP-32 Cam takes a photo every set amount of seconds, breaks it into multiple esp-now packets, then transmits them to another esp32.
+The ESP-32 Cam takes a photo every few seconds, breaks it into multiple esp-now packets, then transmits them to another esp32.
 
 The receiving esp32 sends the received data over serial and your computer reconstructs it with Python.
 
@@ -12,7 +12,7 @@ The receiving esp32 sends the received data over serial and your computer recons
 
 ## Features:
 
- Wifi free image transmission
+- Wifi free image transmission
 - Packet ACKs
 - JPG fragmentation/reassembly
 - Python image reconstruction
@@ -45,8 +45,8 @@ Take the USB-TTL dongle and connect:
 |--|--|
 | +5v | 5v |
 | GND | GND |
-| TXD | VOR |
-| RXD | VOT |
+| TXD | UOR |
+| RXD | UOT |
 
 Connect IOD to GND on the ESP32 Cam to enter bootloader mode(only use when programming)
 This wiring will establish the Serial connection for the esp32 camera.
@@ -67,6 +67,7 @@ Then enable PSRAM for the board.
 
 
 Now it's time to program. Copy & paste the [transmitter source code](https://github.com/lucianbuilds/espnow-image-bridge/blob/main/source/transmitter.ino) into the IDE. After you pasted the code, find the User Settings portion and set **mac_address** to the receiver's mac address. You can change the channel if you'd like, but it has to match the receiver's channel. In the US, channels 1/6/11 are best as they are non overlapping. I personally use channel 6 (2437MHZ).
+
 ![enter image description here](https://raw.githubusercontent.com/lucianbuilds/espnow-image-bridge/refs/heads/main/photos/Transmitter%20config.png)
 
 Now that the config is finished, you are ready to upload your code. Press the Upload button. Once the code is uploaded, open the serial monitor and set the baud rate to 115200. Plug in your receiver then Unplug GND from IOD and unplug and replug in the usb-ttl dongle. If everything is working, you will see "Image transmission successful". 
